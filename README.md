@@ -7,7 +7,7 @@ https://github.com/user-attachments/assets/32bf8f5d-559b-4eab-af23-86d6f0050306
 ## Installation
 
 Installing this currently requires you to clone and install fastplotlib 
-from source using the `masknmf-compute` branch. You can try out 
+from source using the `ndwidget` branch. You can try out 
 the kernels with random matrices using `sanity_check_gen_data.py`.
 
 Running the benchmarks and viz requires the datasets and `masknmf` from the `cached-dmr-arrays` branch, 
@@ -17,7 +17,7 @@ Install `fastplotlib`:
 
 ```bash
 git clone https://github.com/fastplotlib/fastplotlib.git
-git checkout masknmf-compute
+git checkout ndwidget
 
 cd fastplotlib
 
