@@ -822,14 +822,16 @@ class SignalBuffers:
         indices: np.ndarray,
         a_values: wgpu.GPUBuffer,
         temporal_demixed: wgpu.GPUBuffer,
+        first_entry: int = 0,
+        first_row: int = 0,
     ):
-        """copy the entries of a and the traces of the signals ``indices`` (sorted) to the start of a_values and
-        temporal_demixed, in runs of consecutive signals"""
+        """copy the entries of a and the traces of the signals ``indices`` (sorted) to a_values from first_entry and
+        temporal_demixed from first_row, in runs of consecutive signals"""
         a_ptr = self._structures["a_ptr"].astype(np.int64)
         row_size = 4 * self._compression.n_frames_padded
         runs = np.split(indices, np.flatnonzero(np.diff(indices) != 1) + 1) if indices.size else []
-        entry = 0
-        row = 0
+        entry = first_entry
+        row = first_row
         for run in runs:
             first, last = run[0], run[-1] + 1
             n_entries = a_ptr[last] - a_ptr[first]
@@ -890,6 +892,13 @@ class SignalBuffers:
             (self.n_signals, self._compression.n_frames_padded),
         )
         return np.ascontiguousarray(c[:, : self._compression.n_frames].T)
+
+    def get_trace(self, signal: int) -> np.ndarray:
+        """temporal trace of one signal [n_frames]"""
+        device = pygfx.renderers.wgpu.get_shared().device
+        row_size = 4 * self._compression.n_frames_padded
+        data = device.queue.read_buffer(self._buffers["temporal_demixed"], signal * row_size, row_size)
+        return np.frombuffer(data, dtype=np.float32)[: self._compression.n_frames].copy()
 
     def get_b(self) -> np.ndarray:
         """static baseline [n_pixels]"""

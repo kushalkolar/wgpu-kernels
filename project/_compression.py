@@ -33,8 +33,8 @@ def select_adapter(adapter: wgpu.GPUAdapter):
             )
         }
     )
-    if {"subgroup", "subgroups"} & set(adapter.features):
-        pygfx.renderers.wgpu.enable_wgpu_features("subgroups")
+    # wgpu-native has subgroups as the native feature "subgroup", a preferred feature is enabled if the adapter has it
+    wgpu.preconfigure_default_device("select_adapter", preferred_features={"subgroup"})
 
 
 def load_compression(path: str | Path) -> dict:

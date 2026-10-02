@@ -1,5 +1,5 @@
 """
-masknmf's demixing loop (DemixingState.demix) on the GPU, see Demixer
+masknmf's superpixel initialization and demixing loop on the GPU, see Demixer
 """
 
 import itertools
@@ -8,6 +8,7 @@ from collections.abc import Iterator
 import numpy as np
 import pygfx
 import wgpu
+from masknmf.demixing import NoSignalsDetectedError
 from masknmf.demixing.demixing_results import DemixingResults
 
 from ._compression import CompressionBuffers
@@ -17,20 +18,24 @@ from ._hals import (
     SignalBuffers,
     set_constants_and_resources,
     create_buffer,
+    create_empty_buffer,
     read_buffer,
+    dispatch_grid,
 )
 from ._background import FluctuatingBaseline
 from ._correlation import CorrelationImages, sample_noise_frames
 from ._merge import SignalMerger
 from ._local_correlation import LocalCorrelationImage
 from ._results import get_demixing_results
+from ._superpixels import get_patches, get_patch_pairs, select_pure_superpixels
 
 
 class Demixer(GPUComputation):
     """
-    masknmf's demixing of a dataset (DemixingState.demix) on the GPU: ``demix`` runs a pass from initial signals one
-    iteration at a time, the signals of the current iteration in ``signals``, and computes masknmf's outputs at the end
-    of the pass, which ``get_results`` exports.
+    masknmf's demixing of a dataset (InitializingState, DemixingState) on the GPU: ``initialize_signals`` finds new
+    signals in the residual of the signals by superpixels, ``demix`` runs a pass from initial signals one iteration at a
+    time, the signals of the current iteration in ``signals``, and computes masknmf's outputs at the end of the pass,
+    which ``get_results`` exports.
 
     Parameters
     ----------
@@ -61,8 +66,257 @@ class Demixer(GPUComputation):
         self._signals = None
         self._background_rank = None
         self._multiunit = None
+        # (mad_threshold, carry_background) of the local correlation image of initialize_signals, None after a pass
+        self._initialization_image = None
+        # the local correlation image, superpixels and pure superpixels of the last initialize_signals
+        self._superpixels = None
         # x of a_spmm_t for a^T 1
         self._ones = create_buffer(device, np.ones(height * width, dtype=np.float32))
+
+    def initialize_signals(
+        self,
+        mad_threshold: int = 1,
+        mad_correlation_threshold: float = 0.9,
+        min_peak_distance: int = 3,
+        residual_threshold: float = 0.3,
+        patch_size: tuple[int, int] = (100, 100),
+        sign: str = "unconstrained",
+        carry_background: bool = False,
+    ) -> SignalBuffers:
+        """
+        masknmf's superpixel initialization (InitializingState._initialize_signals_superpixels, superpixel_init) on the
+        residual of ``signals``, the signals of the last pass of ``demix``, with their ring term if carry_background, or
+        on U V before the first pass. The local correlation image of the residual with mad_threshold and sign is
+        computed again after a pass or when mad_threshold or carry_background change, masknmf ignores a change of sign.
+        Its peaks above mad_correlation_threshold, the max of their windows of min_peak_distance pixels around them,
+        are one-pixel signals, updated with the signals by one temporal and one spatial HALS update without a ring term.
+        Of them the pure superpixels of each patch of patch_size pixels are selected by successive projection with
+        residual_threshold.
+
+        Returns the signals, unchanged, followed by the pure superpixels, with the ring term of the signals if
+        carry_background. The signals of the Demixer do not change. Raises NoSignalsDetectedError without peaks or
+        pure superpixels.
+        """
+        comp = self._compression
+        correlation = self._correlation
+        # the robust noise term of the last pass, before the first pass drawn as masknmf's InitializingState draws it
+        if correlation.robust_noise is None:
+            correlation.set_robust_noise(sample_noise_frames(comp.n_frames), self._frame_batch_size)
+        signals = self._signals
+        if signals is not None and not carry_background and signals.ring_rank > 0:
+            signals = self._without_ring_term(signals)
+        if self._initialization_image != (mad_threshold, carry_background):
+            self._local_correlation.compute(correlation.robust_noise, mad_threshold, sign, signals)
+            self._initialization_image = (mad_threshold, carry_background)
+
+        peaks = self._get_superpixels(mad_correlation_threshold, min_peak_distance)
+        superpixels = self._update_superpixels(signals, peaks)
+        n_old = 0 if signals is None else signals.n_signals
+        pure = self._select_pure_superpixels(superpixels, n_old, peaks, patch_size, residual_threshold)
+        self._superpixels = (self._local_correlation.get_image(), peaks, peaks[pure])
+
+        # the signals, as they are, followed by the pure superpixels as superpixels has them
+        initialized = self._extend_signals(signals, peaks[pure])
+        b = initialized.buffers
+        n_old_entries = 0 if signals is None else signals.structures["a_pixels"].size
+        encoder = self._new_encoder()
+        superpixels.encode_copy(encoder, n_old + pure, b["a_values"], b["temporal_demixed"], n_old_entries, n_old)
+        self._submit(encoder)
+        if signals is not None and signals.ring_rank > 0:
+            ring = signals.buffers
+            initialized.set_ring_term_buffers(
+                ring["ring_left"], ring["ring_right"], ring["ring_right_t"], signals.ring_rank
+            )
+        return initialized
+
+    def _without_ring_term(self, signals: SignalBuffers) -> SignalBuffers:
+        """signals with the buffers of a, c and b of signals, without a ring term"""
+        s = signals.structures
+        b = signals.buffers
+        return SignalBuffers.from_buffers(
+            self._compression,
+            s["a_pixels"],
+            np.repeat(np.arange(signals.n_signals), np.diff(s["a_ptr"])),
+            signals.n_signals,
+            b["a_values"],
+            b["temporal_demixed"],
+            b["b"],
+            frame_batch_size=self._frame_batch_size,
+        )
+
+    def _get_superpixels(self, mad_correlation_threshold: float, min_peak_distance: int) -> np.ndarray:
+        """masknmf's peaks of the local correlation image (find_local_peaks_2d), the pixels of the superpixels in
+        row-major order, see local_peaks.wgsl"""
+        height, width = self._compression.fov_shape
+        peaks = self._buffer("peaks", 4 * height * width)
+        shader = self._shader("local_peaks")
+        set_constants_and_resources(
+            shader,
+            {
+                "height": height,
+                "width": width,
+                "radius": min_peak_distance,
+                "threshold": float(mad_correlation_threshold),
+            },
+            {0: self._local_correlation.image, 1: peaks},
+        )
+        encoder = self._new_encoder()
+        shader.encode(encoder, *dispatch_grid(-(-height * width // 256)))
+        self._submit(encoder)
+        pixels = np.flatnonzero(read_buffer(peaks, np.uint32, (height * width,)))
+        if pixels.size == 0:
+            raise NoSignalsDetectedError(
+                "No Signals passed correlation threshold. Lower the threshold or verify input data quality."
+            )
+        return pixels
+
+    def _extend_signals(self, signals: SignalBuffers | None, pixels: np.ndarray) -> SignalBuffers:
+        """new signals: those of signals, their a and c copied, followed by signals of one entry each at pixels, their
+        a and c 0, b 0, the groups of the support of a, without a ring term"""
+        device = pygfx.renderers.wgpu.get_shared().device
+        comp = self._compression
+        height, width = comp.fov_shape
+        n_old = 0 if signals is None else signals.n_signals
+        n = n_old + pixels.size
+        old_pixels = np.zeros(0, dtype=np.int64)
+        old_signals = np.zeros(0, dtype=np.int64)
+        if signals is not None:
+            s = signals.structures
+            old_pixels = s["a_pixels"].astype(np.int64)
+            old_signals = np.repeat(np.arange(n_old), np.diff(s["a_ptr"]))
+        a_values = create_empty_buffer(device, 4 * (old_pixels.size + pixels.size))
+        temporal_demixed = create_empty_buffer(device, 4 * n * comp.n_frames_padded)
+        if signals is not None:
+            encoder = self._new_encoder()
+            signals.encode_copy(encoder, np.arange(n_old), a_values, temporal_demixed)
+            self._submit(encoder)
+        return SignalBuffers.from_buffers(
+            comp,
+            np.concatenate([old_pixels, pixels]),
+            np.concatenate([old_signals, n_old + np.arange(pixels.size)]),
+            n,
+            a_values,
+            temporal_demixed,
+            create_empty_buffer(device, 4 * height * width),
+            frame_batch_size=self._frame_batch_size,
+        )
+
+    def _update_superpixels(self, signals: SignalBuffers | None, peaks: np.ndarray) -> SignalBuffers:
+        """
+        masknmf's spatial_temporal_ini_uv: signals followed by a one-pixel signal of value 1 and trace 0 at each peak,
+        updated by a temporal and then a spatial HALS update without a ring term, the groups of the support of a, with
+        masknmf's baseline b = x - a mean(c), x = U mean(V) - a mean(c) of the traces before the updates.
+        """
+        device = pygfx.renderers.wgpu.get_shared().device
+        comp = self._compression
+        height, width = comp.fov_shape
+        superpixels = self._extend_signals(signals, peaks)
+        n = superpixels.n_signals
+        n_old_entries = 0 if signals is None else signals.structures["a_pixels"].size
+        b = superpixels.buffers
+        device.queue.write_buffer(b["a_values"], 4 * n_old_entries, np.ones(peaks.size, dtype=np.float32))
+        if self._hals is None:
+            self._hals = HALS(comp, superpixels)
+        else:
+            self._hals.set_signals(superpixels)
+
+        c = b["temporal_demixed"]
+        sums = self._buffer("superpixel_sums", 4 * n)
+        x = self._buffer("superpixel_x", 4 * height * width)
+        encoder = self._new_encoder()
+        self._encode_row_sums(encoder, "superpixel_sums", c, comp.n_frames_padded, 0, comp.n_frames, sums, n)
+        self._encode_a_spmv(encoder, superpixels, sums, self._correlation.std_corr_img_mean, x)
+        self._encode_a_spmv(encoder, superpixels, sums, x, b["b"])
+        self._hals.temporal_update(True, encoder)
+        self._encode_row_sums(encoder, "superpixel_sums", c, comp.n_frames_padded, 0, comp.n_frames, sums, n)
+        self._encode_a_spmv(encoder, superpixels, sums, x, b["b"])
+        self._hals.spatial_update(encoder)
+        self._submit(encoder)
+        return superpixels
+
+    def _encode_a_spmv(
+        self,
+        encoder: wgpu.GPUCommandEncoder,
+        signals: SignalBuffers,
+        sums: wgpu.GPUBuffer,
+        x: wgpu.GPUBuffer,
+        out: wgpu.GPUBuffer,
+    ):
+        """out = x - a (sums / n_frames) for the a of signals, see a_spmv.wgsl"""
+        comp = self._compression
+        height, width = comp.fov_shape
+        b = signals.buffers
+        shader = self._shader("a_spmv")
+        set_constants_and_resources(
+            shader,
+            {"n_pixels": height * width, "n_frames": comp.n_frames},
+            {
+                0: b["pixel_ptr"],
+                1: b["pixel_entries"],
+                2: b["pixel_signals"],
+                3: b["a_values"],
+                4: sums,
+                5: x,
+                6: out,
+            },
+        )
+        shader.encode(encoder, *dispatch_grid(-(-height * width // 256)))
+
+    def _select_pure_superpixels(
+        self,
+        superpixels: SignalBuffers,
+        n_old: int,
+        peaks: np.ndarray,
+        patch_size: tuple[int, int],
+        residual_threshold: float,
+    ) -> np.ndarray:
+        """
+        masknmf's pure superpixels, of the superpixels after the first n_old signals of superpixels: successive
+        projection in each patch of patch_size pixels, from the products of their traces (trace_products.wgsl on the
+        pairs of each patch) and their sums, the L1 norms of the nonnegative traces.
+
+        Returns the pure superpixels, indices of the superpixels, sorted.
+        """
+        device = pygfx.renderers.wgpu.get_shared().device
+        comp = self._compression
+        n = superpixels.n_signals
+        c = superpixels.buffers["temporal_demixed"]
+        patches, patch_ptr, members = get_patches(peaks, comp.fov_shape, patch_size)
+        neighbor_ptr, neighbors = get_patch_pairs(patches, patch_ptr, members)
+        products = self._buffer("superpixel_products", 4 * neighbors.size)
+        self_products = self._buffer("superpixel_self_products", 4 * n)
+        shader = self._shader("trace_products", "superpixels", reductions=True)
+        set_constants_and_resources(
+            shader,
+            {"n4": comp.n_frames_padded // 4},
+            {
+                0: c,
+                1: c,
+                # the graph of all signals, the first n_old without pairs
+                2: create_buffer(device, np.concatenate([np.zeros(n_old), neighbor_ptr]).astype(np.uint32)),
+                3: create_buffer(device, (n_old + neighbors).astype(np.uint32)),
+                4: products,
+                5: self_products,
+            },
+        )
+        shader.set_uniform(6, np.array([n, 0, 0, 0], dtype=np.uint32))
+        encoder = self._new_encoder()
+        shader.encode(encoder, *dispatch_grid(n))
+        self._submit(encoder)
+        pure = select_pure_superpixels(
+            patch_ptr,
+            members,
+            neighbor_ptr,
+            read_buffer(products, np.float32, (neighbors.size,)),
+            read_buffer(self_products, np.float32, (n,))[n_old:],
+            read_buffer(self._buffer("superpixel_sums", 4 * n), np.float32, (n,))[n_old:],
+            residual_threshold,
+        )
+        if pure.size == 0:
+            raise NoSignalsDetectedError(
+                "No pure superpixels passed the residual threshold. Lower the threshold or verify input data quality."
+            )
+        return pure
 
     def demix(
         self,
@@ -105,6 +359,8 @@ class Demixer(GPUComputation):
 
         # the start of the pass, masknmf's DemixingState and the start of its demix
         self._multiunit = None
+        # the end of the pass writes the global residual correlation image over the image of initialize_signals
+        self._initialization_image = None
         self._correlation.set_robust_noise(sample_noise_frames(comp.n_frames), self._frame_batch_size)
         encoder = self._new_encoder()
         encoder.clear_buffer(signals.buffers["b"])
@@ -252,6 +508,13 @@ class Demixer(GPUComputation):
     def background_rank(self) -> int | None:
         """masknmf's background rank, None until the ring model estimates it"""
         return self._background_rank
+
+    def get_superpixels(self) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        """
+        The local correlation image [height, width] of the last ``initialize_signals``, and the pixels of its superpixels
+        and of its pure superpixels, row-major. None before the first initialization.
+        """
+        return self._superpixels
 
     def get_results(self) -> DemixingResults:
         """masknmf's DemixingResults of the last pass of ``demix``, see ``get_demixing_results``"""
